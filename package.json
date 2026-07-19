@@ -1,6 +1,6 @@
 {
   "name": "@bmichaellee/ai-provider",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "LLM client with interchangeable backends behind one provider-agnostic interface. Ships two Claude backends: the Anthropic API, or a local Claude Code install for keyless development and testing.",
   "keywords": [
     "llm",
