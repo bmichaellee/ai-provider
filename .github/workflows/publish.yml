@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   publish:
@@ -30,8 +31,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: 24
+      - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
       - name: Bump version
         id: bump
@@ -46,8 +47,6 @@ jobs:
           git push origin HEAD:main
       - name: Publish to npm
         run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Tag release
         run: |
           git tag "v${{ steps.bump.outputs.version }}"
