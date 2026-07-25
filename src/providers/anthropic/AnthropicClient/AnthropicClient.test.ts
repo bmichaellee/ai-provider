@@ -427,7 +427,88 @@ describe("AnthropicClient.sendMessage", () => {
       cacheReadInputTokens: 200,
       contextWindow: 1_000_000,
       percentUsed: 50,
+      iteration: 1,
+      providerKind: "anthropic",
     });
+  });
+
+  it("numbers per-call usage events by tool-loop iteration", async () => {
+    const usage = {
+      input_tokens: 1000,
+      output_tokens: 10,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    };
+    finalMessages = [
+      toolUseMessage(
+        [{ id: "t1", name: "echo", input: { value: "x" } }],
+        "",
+        usage,
+      ),
+      textMessage("done", usage),
+    ];
+    const onUsage = vi.fn();
+    await send({ tools: [echoTool()], onUsage });
+    expect(onUsage).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ iteration: 1 }),
+    );
+    expect(onUsage).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ iteration: 2 }),
+    );
+  });
+
+  it("reports summed turn totals via onTurnUsage after the final call", async () => {
+    finalMessages = [
+      toolUseMessage([{ id: "t1", name: "echo", input: { value: "x" } }], "", {
+        input_tokens: 1000,
+        output_tokens: 10,
+        cache_creation_input_tokens: 100,
+        cache_read_input_tokens: 200,
+      }),
+      textMessage("done", {
+        input_tokens: 2000,
+        output_tokens: 20,
+        cache_creation_input_tokens: 300,
+        cache_read_input_tokens: 400,
+      }),
+    ];
+    const onTurnUsage = vi.fn();
+    await send({ tools: [echoTool()], onTurnUsage });
+    expect(onTurnUsage).toHaveBeenCalledTimes(1);
+    expect(onTurnUsage).toHaveBeenCalledWith({
+      inputTokens: 3000,
+      outputTokens: 30,
+      cacheCreationInputTokens: 400,
+      cacheReadInputTokens: 600,
+      iterationCount: 2,
+      contextWindow: 1_000_000,
+      providerKind: "anthropic",
+    });
+  });
+
+  it("reports turn totals when a tool stops the turn early", async () => {
+    finalMessages = [
+      toolUseMessage([{ id: "t1", name: "stop", input: {} }], "farewell", {
+        input_tokens: 500,
+        output_tokens: 5,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      }),
+    ];
+    const onTurnUsage = vi.fn();
+    await send({ tools: [stopTool()], onTurnUsage });
+    expect(onTurnUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ inputTokens: 500, iterationCount: 1 }),
+    );
+  });
+
+  it("does not call onTurnUsage when no response carried usage data", async () => {
+    finalMessages = [textMessage("ok")];
+    const onTurnUsage = vi.fn();
+    await send({ onTurnUsage });
+    expect(onTurnUsage).not.toHaveBeenCalled();
   });
 
   it("normalizes null cache usage fields to zero", async () => {
@@ -479,6 +560,12 @@ describe("AnthropicClient.sendMessage", () => {
     await expect(send({ tools: [echoTool()] })).rejects.toThrow(
       /exceeded 8 tool-use turns/,
     );
+  });
+});
+
+describe("AnthropicClient.providerKind", () => {
+  it('is "anthropic"', () => {
+    expect(new AnthropicClient().providerKind).toBe("anthropic");
   });
 });
 

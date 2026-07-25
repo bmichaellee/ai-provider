@@ -7,6 +7,7 @@ export {
   ClaudeModels,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  LOCAL_SESSION_OVERHEAD_TOKENS,
   LocalClient,
   modelSupportsEffort,
 } from "./providers";
@@ -22,10 +23,14 @@ export type {
   ContextUsage,
   MessageContent,
   MessageRole,
+  ProviderKind,
   ProviderMessage,
   SendOptions,
   SystemPrompt,
   TextBlock,
+  ToolActivity,
+  ToolActivityPhase,
   ToolContext,
   ToolSpec,
+  TurnUsage,
 } from "./types";

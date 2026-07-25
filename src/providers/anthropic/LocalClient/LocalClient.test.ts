@@ -54,7 +54,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   },
 }));
 
-const { LocalClient } = await import("./LocalClient");
+const { LOCAL_SESSION_OVERHEAD_TOKENS, LocalClient, TRANSCRIPT_INSTRUCTION } =
+  await import("./LocalClient");
 
 const HI: ProviderMessage[] = [{ role: "user", content: "hi" }];
 
@@ -65,17 +66,60 @@ const result = (
   subtype: string,
   text = "",
   usage?: Record<string, unknown>,
+  extra: Record<string, unknown> = {},
 ) => ({
   type: "result",
   subtype,
   result: text,
   ...(usage ? { usage } : {}),
+  ...extra,
 });
 
 const assistant = (text: string) => ({
   type: "assistant",
   message: { content: [{ type: "text", text }] },
 });
+
+const assistantWith = (
+  blocks: unknown[],
+  opts: { usage?: Record<string, unknown>; id?: string; parent?: string } = {},
+) => ({
+  type: "assistant",
+  ...(opts.parent ? { parent_tool_use_id: opts.parent } : {}),
+  message: {
+    ...(opts.id ? { id: opts.id } : {}),
+    ...(opts.usage ? { usage: opts.usage } : {}),
+    content: blocks,
+  },
+});
+
+const userWith = (blocks: unknown[]) => ({
+  type: "user",
+  message: { content: blocks },
+});
+
+const textBlock = (text: string) => ({ type: "text", text });
+
+const toolUse = (id: string, name: string, input: unknown = {}) => ({
+  type: "tool_use",
+  id,
+  name,
+  input,
+});
+
+const toolResult = (
+  tool_use_id: string,
+  content: unknown,
+  is_error?: boolean,
+) => ({
+  type: "tool_result",
+  tool_use_id,
+  content,
+  ...(is_error ? { is_error } : {}),
+});
+
+const search = (id = "tu1") =>
+  toolUse(id, "WebSearch", { query: "solar flares" });
 
 const echoTool = (overrides: Partial<ToolSpec> = {}): ToolSpec => ({
   name: "echo",
@@ -210,13 +254,35 @@ describe("LocalClient.sendMessage", () => {
     expect(seen).toEqual([{ tag: "game-state" }]);
   });
 
-  it("flattens the messages into a role-prefixed prompt", async () => {
+  it("sends a single user message as bare content with no role prefix or instruction", async () => {
+    queryMessages = [result("success", "ok")];
+    await send({}, [{ role: "user", content: "one" }]);
+    expect(queryCalls[0].prompt).toBe("one");
+    expect(queryCalls[0].options.systemPrompt).toBeUndefined();
+  });
+
+  it("sends a multi-message conversation as a closed transcript with the standing instruction", async () => {
     queryMessages = [result("success", "ok")];
     await send({}, [
       { role: "user", content: "one" },
       { role: "assistant", content: "two" },
     ]);
-    expect(queryCalls[0].prompt).toBe("user: one\n\nassistant: two");
+    expect(queryCalls[0].prompt).toBe(
+      '<conversation-transcript>\n<turn role="user">\none\n</turn>\n<turn role="assistant">\ntwo\n</turn>\n</conversation-transcript>',
+    );
+    expect(queryCalls[0].options.systemPrompt).toBe(TRANSCRIPT_INSTRUCTION);
+  });
+
+  it("appends the standing instruction after the consumer system prompt on transcripts", async () => {
+    queryMessages = [result("success", "ok")];
+    await send({ system: "be the weaver" }, [
+      { role: "user", content: "one" },
+      { role: "assistant", content: "two" },
+    ]);
+    expect(queryCalls[0].options.systemPrompt).toEqual([
+      "be the weaver",
+      TRANSCRIPT_INSTRUCTION,
+    ]);
   });
 
   it("flattens cache_control-bearing system blocks into a plain string prompt, ignoring the cache hints", async () => {
@@ -234,7 +300,7 @@ describe("LocalClient.sendMessage", () => {
     expect(queryCalls[0].options.systemPrompt).toBe("stable and live");
   });
 
-  it("flattens cache_control-bearing message blocks into the role-prefixed prompt", async () => {
+  it("flattens cache_control-bearing message blocks into the bare prompt", async () => {
     queryMessages = [result("success", "ok")];
     await send({}, [
       {
@@ -248,7 +314,7 @@ describe("LocalClient.sendMessage", () => {
         ],
       },
     ]);
-    expect(queryCalls[0].prompt).toBe("user: hello");
+    expect(queryCalls[0].prompt).toBe("hello");
   });
 
   it("asks the SDK to think adaptively but omit thinking from the output", async () => {
@@ -344,7 +410,128 @@ describe("LocalClient.sendMessage", () => {
     expect(queryReturned).toBe(true);
   });
 
-  it("reports context usage derived from the model's context window on a successful result", async () => {
+  it("reports per-call usage from each assistant message, honestly sized to that call", async () => {
+    queryMessages = [
+      assistantWith([textBlock("one")], {
+        id: "m1",
+        usage: {
+          input_tokens: 99_980,
+          output_tokens: 50,
+          cache_creation_input_tokens: 10,
+          cache_read_input_tokens: 10,
+        },
+      }),
+      assistantWith([textBlock("two")], {
+        id: "m2",
+        usage: {
+          input_tokens: 149_990,
+          output_tokens: 60,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 10,
+        },
+      }),
+      result("success", "two"),
+    ];
+    const onUsage = vi.fn();
+    await send({ model: "claude-haiku-4-5", onUsage });
+    expect(onUsage).toHaveBeenNthCalledWith(1, {
+      inputTokens: 99_980,
+      outputTokens: 50,
+      cacheCreationInputTokens: 10,
+      cacheReadInputTokens: 10,
+      contextWindow: 200_000,
+      percentUsed: 50,
+      iteration: 1,
+      providerKind: "local",
+      sessionOverheadTokens: LOCAL_SESSION_OVERHEAD_TOKENS,
+    });
+    expect(onUsage).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ iteration: 2, percentUsed: 75 }),
+    );
+  });
+
+  it("normalizes null cache fields on per-call usage to zero", async () => {
+    queryMessages = [
+      assistantWith([textBlock("ok")], {
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 5,
+          cache_creation_input_tokens: null,
+          cache_read_input_tokens: null,
+        },
+      }),
+      result("success", "ok"),
+    ];
+    const onUsage = vi.fn();
+    await send({ onUsage });
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 0,
+      }),
+    );
+  });
+
+  it("reports usage once per API call when the SDK splits it across messages sharing an id", async () => {
+    const usage = {
+      input_tokens: 1000,
+      output_tokens: 5,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    };
+    queryMessages = [
+      assistantWith([textBlock("part one")], { id: "m1", usage }),
+      assistantWith([textBlock("part two")], { id: "m1", usage }),
+      result("success", "part two"),
+    ];
+    const onUsage = vi.fn();
+    await send({ onUsage });
+    expect(onUsage).toHaveBeenCalledTimes(1);
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ iteration: 1 }),
+    );
+  });
+
+  it("skips usage from subagent assistant messages so the window reading stays the main thread's", async () => {
+    queryMessages = [
+      assistantWith([textBlock("subagent chatter")], {
+        id: "s1",
+        parent: "tu1",
+        usage: {
+          input_tokens: 42,
+          output_tokens: 5,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+      }),
+      result("success", "done"),
+    ];
+    const onUsage = vi.fn();
+    await send({ onUsage });
+    expect(onUsage).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the default model's context window when none is specified", async () => {
+    queryMessages = [
+      assistantWith([textBlock("ok")], {
+        usage: {
+          input_tokens: 500_000,
+          output_tokens: 50,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+      }),
+      result("success", "ok"),
+    ];
+    const onUsage = vi.fn();
+    await send({ onUsage });
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ contextWindow: 1_000_000, percentUsed: 50 }),
+    );
+  });
+
+  it("does not route the cumulative result usage through onUsage", async () => {
     queryMessages = [
       result("success", "ok", {
         input_tokens: 100_000,
@@ -354,34 +541,88 @@ describe("LocalClient.sendMessage", () => {
       }),
     ];
     const onUsage = vi.fn();
-    await send({ model: "claude-haiku-4-5", onUsage });
-    expect(onUsage).toHaveBeenCalledWith({
-      inputTokens: 100_000,
-      outputTokens: 50,
-      cacheCreationInputTokens: 10,
-      cacheReadInputTokens: 20,
+    await send({ onUsage });
+    expect(onUsage).not.toHaveBeenCalled();
+  });
+
+  it("reports turn totals via onTurnUsage from the result message", async () => {
+    queryMessages = [
+      assistant("ok"),
+      result(
+        "success",
+        "ok",
+        {
+          input_tokens: 995_000,
+          output_tokens: 4_000,
+          cache_creation_input_tokens: 2_000,
+          cache_read_input_tokens: 3_000,
+        },
+        {
+          num_turns: 12,
+          total_cost_usd: 1.25,
+          modelUsage: { "claude-haiku-4-5": { contextWindow: 200_000 } },
+        },
+      ),
+    ];
+    const onTurnUsage = vi.fn();
+    await send({ model: "claude-haiku-4-5", onTurnUsage });
+    expect(onTurnUsage).toHaveBeenCalledTimes(1);
+    expect(onTurnUsage).toHaveBeenCalledWith({
+      inputTokens: 995_000,
+      outputTokens: 4_000,
+      cacheCreationInputTokens: 2_000,
+      cacheReadInputTokens: 3_000,
+      iterationCount: 12,
       contextWindow: 200_000,
-      percentUsed: 50,
+      costUSD: 1.25,
+      providerKind: "local",
     });
   });
 
-  it("falls back to the default model's context window when none is specified", async () => {
+  it("takes the turn context window from the sole modelUsage entry when its key differs", async () => {
     queryMessages = [
-      result("success", "ok", {
-        input_tokens: 500_000,
-        output_tokens: 50,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-      }),
+      result(
+        "success",
+        "ok",
+        {
+          input_tokens: 1000,
+          output_tokens: 10,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+        {
+          modelUsage: { "claude-haiku-4-5-20251001": { contextWindow: 200_000 } },
+        },
+      ),
     ];
-    const onUsage = vi.fn();
-    await send({ onUsage });
-    expect(onUsage).toHaveBeenCalledWith(
-      expect.objectContaining({ contextWindow: 1_000_000, percentUsed: 50 }),
+    const onTurnUsage = vi.fn();
+    await send({ onTurnUsage });
+    expect(onTurnUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ contextWindow: 200_000 }),
     );
   });
 
-  it("captures usage from the result message even when a stop tool already fired, if the result is the very next message", async () => {
+  it("falls back to the model map window and counted iterations when the result is bare", async () => {
+    const usage = {
+      input_tokens: 1000,
+      output_tokens: 10,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    };
+    queryMessages = [
+      assistantWith([textBlock("one")], { id: "m1", usage }),
+      assistantWith([textBlock("two")], { id: "m2", usage }),
+      result("success", "two", usage),
+    ];
+    const onTurnUsage = vi.fn();
+    await send({ onTurnUsage });
+    expect(onTurnUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ contextWindow: 1_000_000, iterationCount: 2 }),
+    );
+    expect(onTurnUsage.mock.calls[0][0]).not.toHaveProperty("costUSD");
+  });
+
+  it("captures turn totals even when a stop tool already fired, if the result is the very next message", async () => {
     const stopTool = echoTool({
       name: "present_choice",
       run: async (_input: any, ctx?: ToolContext) => {
@@ -399,14 +640,14 @@ describe("LocalClient.sendMessage", () => {
         cache_read_input_tokens: 0,
       }),
     ];
-    const onUsage = vi.fn();
-    await send({ tools: [stopTool], onUsage, model: "claude-haiku-4-5" });
-    expect(onUsage).toHaveBeenCalledWith(
+    const onTurnUsage = vi.fn();
+    await send({ tools: [stopTool], onTurnUsage, model: "claude-haiku-4-5" });
+    expect(onTurnUsage).toHaveBeenCalledWith(
       expect.objectContaining({ inputTokens: 100_000, contextWindow: 200_000 }),
     );
   });
 
-  it("captures usage even when stray messages (e.g. the SDK's own tool-result echo) follow a stop tool before the terminal result", async () => {
+  it("captures turn totals even when stray messages (e.g. the SDK's own tool-result echo) follow a stop tool before the terminal result", async () => {
     const stopTool = echoTool({
       name: "present_choice",
       run: async (_input: any, ctx?: ToolContext) => {
@@ -426,26 +667,257 @@ describe("LocalClient.sendMessage", () => {
         cache_read_input_tokens: 0,
       }),
     ];
-    const onUsage = vi.fn();
+    const onTurnUsage = vi.fn();
     const streamed: string[] = [];
     const result_ = await send({
       tools: [stopTool],
-      onUsage,
+      onTurnUsage,
       onText: (s: string) => streamed.push(s),
       model: "claude-haiku-4-5",
     });
     expect(result_).toEqual(["here are your options"]);
     expect(streamed).toEqual(["here are your options"]);
-    expect(onUsage).toHaveBeenCalledWith(
+    expect(onTurnUsage).toHaveBeenCalledWith(
       expect.objectContaining({ inputTokens: 100_000, contextWindow: 200_000 }),
     );
   });
 
-  it("does not call onUsage when the result carries no usage data", async () => {
-    queryMessages = [result("success", "ok")];
+  it("calls neither usage callback when the stream carries no usage data", async () => {
+    queryMessages = [assistant("ok"), result("success", "ok")];
     const onUsage = vi.fn();
-    await send({ onUsage });
+    const onTurnUsage = vi.fn();
+    await send({ onUsage, onTurnUsage });
     expect(onUsage).not.toHaveBeenCalled();
+    expect(onTurnUsage).not.toHaveBeenCalled();
+  });
+});
+
+describe("LocalClient tool activity", () => {
+  const collect = () => {
+    const events: any[] = [];
+    return { events, onToolActivity: (a: any) => events.push(a) };
+  };
+
+  it("fires a start activity for a built-in tool_use with a one-line input summary", async () => {
+    queryMessages = [assistantWith([search()]), result("success", "done")];
+    const { events, onToolActivity } = collect();
+    await send({ onToolActivity });
+    expect(events).toEqual([
+      {
+        phase: "start",
+        toolName: "WebSearch",
+        toolUseId: "tu1",
+        summary: 'WebSearch: {"query":"solar flares"}',
+        detail: '{"query":"solar flares"}',
+      },
+    ]);
+  });
+
+  it("fires an end activity correlated by tool_use_id when the result arrives", async () => {
+    queryMessages = [
+      assistantWith([search()]),
+      userWith([toolResult("tu1", "flare imminent")]),
+      result("success", "done"),
+    ];
+    const { events, onToolActivity } = collect();
+    await send({ onToolActivity });
+    expect(events[1]).toEqual({
+      phase: "end",
+      toolName: "WebSearch",
+      toolUseId: "tu1",
+      summary: "WebSearch: flare imminent",
+      detail: "flare imminent",
+    });
+  });
+
+  it("marks an errored tool result and prefixes its summary", async () => {
+    queryMessages = [
+      assistantWith([search()]),
+      userWith([toolResult("tu1", "rate limited", true)]),
+      result("success", "done"),
+    ];
+    const { events, onToolActivity } = collect();
+    await send({ onToolActivity });
+    expect(events[1]).toMatchObject({
+      phase: "end",
+      isError: true,
+      summary: "WebSearch: error: rate limited",
+    });
+  });
+
+  it("flattens block-array tool_result content", async () => {
+    queryMessages = [
+      assistantWith([search()]),
+      userWith([
+        toolResult("tu1", [textBlock("line one"), textBlock("line two")]),
+      ]),
+      result("success", "done"),
+    ];
+    const { events, onToolActivity } = collect();
+    await send({ onToolActivity });
+    expect(events[1]).toMatchObject({
+      summary: "WebSearch: line one line two",
+      detail: "line one\nline two",
+    });
+  });
+
+  it("stays silent for the app's own MCP tools", async () => {
+    queryMessages = [
+      assistantWith([toolUse("tu9", "mcp__tools__echo", { value: "x" })]),
+      userWith([toolResult("tu9", "echoed:x")]),
+      result("success", "done"),
+    ];
+    const { events, onToolActivity } = collect();
+    await send({ tools: [echoTool()], onToolActivity });
+    expect(events).toEqual([]);
+  });
+
+  it("truncates a long input to a single-line summary but keeps full detail", async () => {
+    const long = "b".repeat(200);
+    queryMessages = [
+      assistantWith([toolUse("tu1", "Bash", { command: long })]),
+      result("success", "done"),
+    ];
+    const { events, onToolActivity } = collect();
+    await send({ onToolActivity });
+    expect(events[0].detail).toBe(JSON.stringify({ command: long }));
+    expect(events[0].summary.endsWith("…")).toBe(true);
+    expect(events[0].summary.length).toBeLessThanOrEqual(
+      "Bash: ".length + 121,
+    );
+  });
+
+  it("keeps reporting activity after a stop tool fires", async () => {
+    const stopTool = echoTool({
+      name: "disengage",
+      run: async (_input: any, ctx?: ToolContext) => {
+        if (ctx) ctx.stop = true;
+        return "disengaged";
+      },
+    });
+    queryMessages = [
+      { type: "__runTool", index: 0, args: {} },
+      assistantWith([search()]),
+      userWith([toolResult("tu1", "late result")]),
+      result("success", ""),
+    ];
+    const { events, onToolActivity } = collect();
+    await send({ tools: [stopTool], onToolActivity });
+    expect(events.map((e) => e.phase)).toEqual(["start", "end"]);
+  });
+});
+
+describe("LocalClient interstitial commentary", () => {
+  it("diverts text sharing a message with built-in tool calls out of the transcript", async () => {
+    queryMessages = [
+      assistantWith([textBlock("let the search finish"), search()]),
+      assistant("the real reply"),
+      result("success", "the real reply"),
+    ];
+    const events: any[] = [];
+    const streamed: string[] = [];
+    const segments = await send({
+      onText: (s: string) => streamed.push(s),
+      onToolActivity: (a: any) => events.push(a),
+    });
+    expect(segments).toEqual(["the real reply"]);
+    expect(streamed).toEqual(["the real reply"]);
+    expect(events).toContainEqual({
+      phase: "commentary",
+      toolName: "WebSearch",
+      toolUseId: "tu1",
+      summary: "let the search finish",
+      detail: "let the search finish",
+    });
+  });
+
+  it("diverts commentary split across SDK messages sharing an API message id", async () => {
+    queryMessages = [
+      assistantWith([textBlock("let me look that up")], { id: "m1" }),
+      assistantWith([search()], { id: "m1" }),
+      assistant("the real reply"),
+      result("success", "the real reply"),
+    ];
+    const events: any[] = [];
+    const streamed: string[] = [];
+    const segments = await send({
+      onText: (s: string) => streamed.push(s),
+      onToolActivity: (a: any) => events.push(a),
+    });
+    expect(segments).toEqual(["the real reply"]);
+    expect(streamed).toEqual(["the real reply"]);
+    expect(events).toContainEqual({
+      phase: "commentary",
+      toolName: "WebSearch",
+      toolUseId: "tu1",
+      summary: "let me look that up",
+      detail: "let me look that up",
+    });
+  });
+
+  it("keeps a split API message grouped across interleaved informational events", async () => {
+    queryMessages = [
+      assistantWith([textBlock("let me look that up")], { id: "m1" }),
+      { type: "rate_limit_event" },
+      assistantWith([search()], { id: "m1" }),
+      userWith([toolResult("tu1", "found it")]),
+      assistant("the real reply"),
+      result("success", "the real reply"),
+    ];
+    const events: any[] = [];
+    const segments = await send({ onToolActivity: (a: any) => events.push(a) });
+    expect(segments).toEqual(["the real reply"]);
+    expect(events.map((e) => e.phase)).toEqual(["start", "commentary", "end"]);
+  });
+
+  it("emits buffered text once its API message completes without tool calls", async () => {
+    queryMessages = [
+      assistantWith([textBlock("part one")], { id: "m1" }),
+      assistantWith([textBlock("part two")], { id: "m1" }),
+      assistantWith([textBlock("next call")], { id: "m2" }),
+      result("success", "next call"),
+    ];
+    expect(await send()).toEqual(["part one\npart two", "next call"]);
+  });
+
+  it("still emits text that accompanies only the app's MCP tools", async () => {
+    queryMessages = [
+      assistantWith([
+        textBlock("choosing"),
+        toolUse("t1", "mcp__tools__echo", { value: "x" }),
+      ]),
+      result("success", "done"),
+    ];
+    const streamed: string[] = [];
+    expect(
+      await send({ tools: [echoTool()], onText: (s: string) => streamed.push(s) }),
+    ).toEqual(["choosing"]);
+    expect(streamed).toEqual(["choosing"]);
+  });
+
+  it("drops commentary from the transcript even when no activity callback is registered", async () => {
+    queryMessages = [
+      assistantWith([textBlock("let the search finish"), search()]),
+      assistant("the real reply"),
+      result("success", "the real reply"),
+    ];
+    expect(await send()).toEqual(["the real reply"]);
+  });
+
+  it("returns no segments for a commentary-only turn instead of re-leaking via the result fallback", async () => {
+    queryMessages = [
+      assistantWith([textBlock("working on it"), search()]),
+      result("success", "working on it"),
+    ];
+    const streamed: string[] = [];
+    expect(await send({ onText: (s: string) => streamed.push(s) })).toEqual([]);
+    expect(streamed).toEqual([]);
+  });
+});
+
+describe("LocalClient.providerKind", () => {
+  it('is "local"', () => {
+    expect(new LocalClient().providerKind).toBe("local");
   });
 });
 
