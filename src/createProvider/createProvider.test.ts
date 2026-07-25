@@ -6,6 +6,7 @@ const localSend = vi.fn(async () => ["local-reply"]);
 
 vi.mock("../providers", () => ({
   AnthropicClient: class {
+    providerKind = "anthropic";
     sendMessage = anthropicSend;
     destroy = async () => {};
     constructor(apiKey?: string) {
@@ -13,6 +14,7 @@ vi.mock("../providers", () => ({
     }
   },
   LocalClient: class {
+    providerKind = "local";
     sendMessage = localSend;
     destroy = async () => {};
   },
@@ -32,6 +34,7 @@ describe("createProvider", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-env");
     const provider = createProvider();
     expect(provider).toBeInstanceOf(AnthropicClient);
+    expect(provider.providerKind).toBe("anthropic");
     expect(
       await provider.sendMessage([{ role: "user", content: "hi" }]),
     ).toEqual(["anthropic-reply"]);
@@ -42,6 +45,7 @@ describe("createProvider", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "");
     const provider = createProvider();
     expect(provider).toBeInstanceOf(LocalClient);
+    expect(provider.providerKind).toBe("local");
     expect(
       await provider.sendMessage([{ role: "user", content: "hi" }]),
     ).toEqual(["local-reply"]);

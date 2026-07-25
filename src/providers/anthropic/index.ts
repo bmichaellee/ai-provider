@@ -1,5 +1,5 @@
 export { AnthropicClient } from "./AnthropicClient";
-export { LocalClient } from "./LocalClient";
+export { LOCAL_SESSION_OVERHEAD_TOKENS, LocalClient } from "./LocalClient";
 export {
   ClaudeContextWindow,
   ClaudeMaxTokens,

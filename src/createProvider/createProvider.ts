@@ -1,7 +1,7 @@
 import { AnthropicClient, LocalClient } from "../providers";
-import type { AIProvider } from "../types";
+import type { AIProvider, ProviderKind } from "../types";
 
-export type ProviderBackend = "anthropic" | "local";
+export type ProviderBackend = ProviderKind;
 
 export type ProviderConfig = {
   backend?: ProviderBackend;

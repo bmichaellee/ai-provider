@@ -14,6 +14,7 @@ import type {
   SendOptions,
   ToolContext,
   ToolSpec,
+  TurnUsage,
 } from "../../../types";
 import { executeTool } from "../../../executeTool";
 
@@ -34,6 +35,7 @@ const textOf = (content: Anthropic.ContentBlock[]): string =>
 const usageOf = (
   usage: Anthropic.Usage | undefined,
   contextWindow: number,
+  iteration: number,
 ): ContextUsage | undefined => {
   if (!usage) return undefined;
   const inputTokens = usage.input_tokens;
@@ -48,10 +50,14 @@ const usageOf = (
     cacheReadInputTokens,
     contextWindow,
     percentUsed: Math.round((consumed / contextWindow) * 1000) / 10,
+    iteration,
+    providerKind: "anthropic",
   };
 };
 
 export class AnthropicClient implements AIProvider {
+  readonly providerKind = "anthropic" as const;
+
   private client: Anthropic;
 
   constructor(apiKey?: string) {
@@ -80,6 +86,19 @@ export class AnthropicClient implements AIProvider {
       options.onText?.(text);
     };
 
+    const turnTotals: TurnUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      iterationCount: 0,
+      contextWindow: ClaudeContextWindow[model],
+      providerKind: "anthropic",
+    };
+    const emitTurnUsage = () => {
+      if (turnTotals.iterationCount) options.onTurnUsage?.(turnTotals);
+    };
+
     for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
       const stream = this.client.messages.stream({
         model,
@@ -91,11 +110,19 @@ export class AnthropicClient implements AIProvider {
       });
       const message = await stream.finalMessage();
 
-      const usage = usageOf(message.usage, ClaudeContextWindow[model]);
-      if (usage) options.onUsage?.(usage);
+      const usage = usageOf(message.usage, ClaudeContextWindow[model], turn + 1);
+      if (usage) {
+        turnTotals.inputTokens += usage.inputTokens;
+        turnTotals.outputTokens += usage.outputTokens;
+        turnTotals.cacheCreationInputTokens += usage.cacheCreationInputTokens;
+        turnTotals.cacheReadInputTokens += usage.cacheReadInputTokens;
+        turnTotals.iterationCount += 1;
+        options.onUsage?.(usage);
+      }
 
       if (message.stop_reason !== "tool_use") {
         emit(textOf(message.content));
+        emitTurnUsage();
         return segments;
       }
 
@@ -149,6 +176,7 @@ export class AnthropicClient implements AIProvider {
 
       if (ctx.stop) {
         if (!segments.length && options.stopText) emit(options.stopText);
+        emitTurnUsage();
         return segments;
       }
     }
