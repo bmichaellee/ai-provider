@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
-import type { SendOptions, ToolSpec } from "../../../types";
+import type { SendOptions } from "../../../types";
+import { echoTool } from "../../../testing/tools";
+import { ClaudeModels } from "../types";
 
 let finalMessages: any[] = [];
 const streamCalls: any[] = [];
@@ -52,13 +54,6 @@ const toolUseMessage = (
   ...(usage ? { usage } : {}),
 });
 
-const echoTool = (overrides: Partial<ToolSpec> = {}): ToolSpec => ({
-  name: "echo",
-  description: "echoes its argument",
-  schema: z.object({ value: z.string() }),
-  run: async (input: any) => `echoed:${input.value}`,
-  ...overrides,
-});
 
 const stopTool = () =>
   echoTool({
@@ -206,6 +201,38 @@ describe("AnthropicClient.sendMessage", () => {
     expect(streamCalls[0].output_config).toBeUndefined();
   });
 
+  it("carries the Opus model id and its output cap to the wire", async () => {
+    finalMessages = [textMessage("ok")];
+    await send({ model: ClaudeModels.Opus });
+    expect(streamCalls[0].model).toBe(ClaudeModels.Opus);
+    expect(streamCalls[0].max_tokens).toBe(128000);
+  });
+
+  it("passes the top effort level through on Opus", async () => {
+    finalMessages = [textMessage("ok")];
+    await send({ model: ClaudeModels.Opus, effort: "max" });
+    expect(streamCalls[0].output_config).toEqual({ effort: "max" });
+  });
+
+  it("carries the Fable model id to the wire", async () => {
+    finalMessages = [textMessage("ok")];
+    await send({ model: ClaudeModels.Fable });
+    expect(streamCalls[0].model).toBe(ClaudeModels.Fable);
+  });
+
+  it("requests adaptive thinking so both backends behave alike", async () => {
+    finalMessages = [textMessage("ok")];
+    await send();
+    expect(streamCalls[0].thinking).toEqual({ type: "adaptive" });
+  });
+
+  it("sends a numeric output cap even for a model absent from the catalog", async () => {
+    finalMessages = [textMessage("ok")];
+    await send({ model: "claude-not-a-real-model" as any });
+    expect(typeof streamCalls[0].max_tokens).toBe("number");
+    expect(streamCalls[0].max_tokens).toBeGreaterThan(0);
+  });
+
   it("only includes tools in the request when some are provided", async () => {
     finalMessages = [textMessage("ok")];
     await send();
@@ -216,7 +243,7 @@ describe("AnthropicClient.sendMessage", () => {
     expect(streamCalls[1].tools).toHaveLength(1);
     expect(streamCalls[1].tools[0]).toMatchObject({
       name: "echo",
-      description: "echoes its argument",
+      description: "echoes",
     });
     expect(streamCalls[1].tools[0].input_schema).toBeDefined();
   });
@@ -410,21 +437,23 @@ describe("AnthropicClient.sendMessage", () => {
   });
 
   it("reports context usage as the sum of fresh, cache-write, and cache-read tokens against the model's context window", async () => {
+    // Each term is large enough to move percentUsed on its own: fresh alone
+    // reads 40, fresh + cache-write 45, all three 50.
     finalMessages = [
       textMessage("ok", {
-        input_tokens: 499_500,
+        input_tokens: 400_000,
         output_tokens: 100,
-        cache_creation_input_tokens: 300,
-        cache_read_input_tokens: 200,
+        cache_creation_input_tokens: 50_000,
+        cache_read_input_tokens: 50_000,
       }),
     ];
     const onUsage = vi.fn();
     await send({ onUsage });
     expect(onUsage).toHaveBeenCalledWith({
-      inputTokens: 499_500,
+      inputTokens: 400_000,
       outputTokens: 100,
-      cacheCreationInputTokens: 300,
-      cacheReadInputTokens: 200,
+      cacheCreationInputTokens: 50_000,
+      cacheReadInputTokens: 50_000,
       contextWindow: 1_000_000,
       percentUsed: 50,
       iteration: 1,

@@ -1,4 +1,6 @@
-import { ClaudeContextWindow, DEFAULT_MODEL } from "../types";
+import { DEFAULT_MODEL, contextWindowFor } from "../types";
+import { contextUsageOf, turnUsageOf, usableWindow } from "../usage";
+import type { RawUsage } from "../usage";
 import type {
   AIProvider,
   ContextUsage,
@@ -12,6 +14,7 @@ import type {
   TurnUsage,
 } from "../../../types";
 import { executeTool } from "../../../executeTool";
+import { RefusalError } from "../../../errors";
 
 const MCP_SERVER = "tools";
 const TOOL_PREFIX = `mcp__${MCP_SERVER}__`;
@@ -69,39 +72,23 @@ const loadAgentSdk = async (): Promise<AgentSdk> => {
   }
 };
 
-type SdkUsage = {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens?: number | null;
-  cache_read_input_tokens?: number | null;
-};
+type SdkUsage = RawUsage;
 
-const usageOf = (
+const localUsageOf = (
   usage: SdkUsage,
   contextWindow: number,
   iteration: number,
-): ContextUsage => {
-  const inputTokens = usage.input_tokens;
-  const cacheCreationInputTokens = usage.cache_creation_input_tokens ?? 0;
-  const cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
-  const consumed =
-    inputTokens + cacheCreationInputTokens + cacheReadInputTokens;
-  return {
-    inputTokens,
-    outputTokens: usage.output_tokens,
-    cacheCreationInputTokens,
-    cacheReadInputTokens,
+): ContextUsage =>
+  contextUsageOf(usage, {
     contextWindow,
-    percentUsed: Math.round((consumed / contextWindow) * 1000) / 10,
     iteration,
     providerKind: "local",
     sessionOverheadTokens: LOCAL_SESSION_OVERHEAD_TOKENS,
-  };
-};
+  });
 
 type SdkModelUsage = Record<string, { contextWindow?: number }>;
 
-const turnUsageOf = (
+const localTurnUsageOf = (
   usage: SdkUsage,
   iterationCount: number,
   fallbackWindow: number,
@@ -112,16 +99,15 @@ const turnUsageOf = (
   const entries = modelUsage ? Object.entries(modelUsage) : [];
   const entry =
     modelUsage?.[model] ?? (entries.length === 1 ? entries[0][1] : undefined);
-  return {
-    inputTokens: usage.input_tokens,
-    outputTokens: usage.output_tokens,
-    cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
-    cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
+  return turnUsageOf(usage, {
     iterationCount,
-    contextWindow: entry?.contextWindow ?? fallbackWindow,
-    ...(costUSD === undefined ? {} : { costUSD }),
+    // The SDK's figure wins when it is usable, since it reflects the session
+    // the turn actually ran in; a zero or NaN falls back to the catalog.
+    contextWindow: usableWindow(entry?.contextWindow) ?? fallbackWindow,
     providerKind: "local",
-  };
+    ...(costUSD === undefined ? {} : { costUSD }),
+    sessionOverheadTokens: LOCAL_SESSION_OVERHEAD_TOKENS,
+  });
 };
 
 type SdkContentBlock = {
@@ -184,7 +170,7 @@ export class LocalClient implements AIProvider {
     const transcript = !isBareMessage(messages);
     const tools = options.tools ?? [];
     const model = options.model ?? DEFAULT_MODEL;
-    const contextWindow = ClaudeContextWindow[model];
+    const contextWindow = contextWindowFor(model);
     const ctx: ToolContext<TApp> = {
       stop: false,
       app: options.context,
@@ -234,6 +220,22 @@ export class LocalClient implements AIProvider {
       },
     });
 
+    let refusal: {
+      category: string | null;
+      explanation: string | null;
+      model?: string;
+    } | null = null;
+    const refusalError = () =>
+      new RefusalError({
+        providerKind: "local",
+        // Prefer the model the session reports having run: without an
+        // explicit model the CLI picks its own default, and naming the
+        // package's default here would describe a model that never ran.
+        model: refusal?.model ?? options.model ?? model,
+        category: refusal?.category ?? null,
+        explanation: refusal?.explanation ?? null,
+      });
+
     // tool_use_id -> toolName, for built-in (non-MCP) tools awaiting results.
     const pendingTools = new Map<string, string>();
     const seenApiMessageIds = new Set<string>();
@@ -246,12 +248,17 @@ export class LocalClient implements AIProvider {
     // blocks per id and decide at flush.
     let group: {
       id: string | undefined;
+      uuid: string | undefined;
       texts: string[];
       builtins: { name: string; id: string }[];
     } | null = null;
+    // Text already emitted, keyed by the frame that produced it, so a later
+    // retraction can take it back out of the returned segments.
+    const emittedByUuid = new Map<string, string>();
     const flushGroup = () => {
       if (!group) return;
       const text = group.texts.join("\n");
+      const uuid = group.uuid;
       if (group.builtins.length) {
         if (text.trim()) {
           divertedCommentary = true;
@@ -264,9 +271,35 @@ export class LocalClient implements AIProvider {
           });
         }
       } else if (!ctx.stop) {
+        const before = segments.length;
         emit(text);
+        if (uuid && segments.length > before) emittedByUuid.set(uuid, text);
       }
       group = null;
+    };
+
+    /**
+     * Drop content the harness has voided. When a refusal is retried on a
+     * fallback model, the refused leg's partial answer is retracted and
+     * replaced — without this it would be flushed into segments and prefixed
+     * to the retry's real answer. Text still buffered is dropped before it is
+     * ever emitted; text already emitted is removed from the returned
+     * segments. An onText callback that already fired cannot be recalled, so
+     * consumers rendering the stream live should treat a retraction-carrying
+     * frame as replacing what came before it.
+     */
+    const retract = (uuids: string[]) => {
+      for (const uuid of uuids) {
+        if (group?.uuid === uuid) {
+          group = null;
+          continue;
+        }
+        const text = emittedByUuid.get(uuid);
+        if (text === undefined) continue;
+        const at = segments.lastIndexOf(text);
+        if (at !== -1) segments.splice(at, 1);
+        emittedByUuid.delete(uuid);
+      }
     };
 
     try {
@@ -279,7 +312,7 @@ export class LocalClient implements AIProvider {
           if (message.subtype === "success") {
             if (message.usage)
               options.onTurnUsage?.(
-                turnUsageOf(
+                localTurnUsageOf(
                   message.usage,
                   (message as { num_turns?: number }).num_turns ?? iteration,
                   contextWindow,
@@ -288,6 +321,11 @@ export class LocalClient implements AIProvider {
                   (message as { total_cost_usd?: number }).total_cost_usd,
                 ),
               );
+            // Turn usage is reported first, then the refusal is raised: the
+            // spend happened whether or not the model answered.
+            const stopReason = (message as { stop_reason?: string | null })
+              .stop_reason;
+            if (refusal || stopReason === "refusal") throw refusalError();
             if (ctx.stop) {
               emitStopText();
             } else if (
@@ -301,16 +339,52 @@ export class LocalClient implements AIProvider {
           }
           throw new Error(`LocalClient query failed: ${message.subtype}`);
         }
-        if (message.type === "system" && message.subtype === "init") {
-          this.sessionIds.push(message.session_id);
+        if (message.type === "system") {
+          if (message.subtype === "init") this.sessionIds.push(message.session_id);
+          // A refusal the harness could not retry ends the turn. Its sibling
+          // "model_refusal_fallback" means the retry ran and succeeded, so it
+          // is not a failure — but the refused leg's partial answer is
+          // retracted, and must not reach the caller alongside the retry's.
+          // Both subtypes are absent on older CLIs, which is why the result's
+          // stop_reason is also checked.
+          if (message.subtype === "model_refusal_fallback") {
+            const retracted = (message as { retracted_message_uuids?: string[] })
+              .retracted_message_uuids;
+            if (retracted?.length) retract(retracted);
+          }
+          if (message.subtype === "model_refusal_no_fallback") {
+            const refused = message as {
+              api_refusal_category?: string | null;
+              api_refusal_explanation?: string | null;
+              original_model?: string;
+            };
+            refusal = {
+              category: refused.api_refusal_category ?? null,
+              explanation: refused.api_refusal_explanation ?? null,
+              // The model that actually ran and refused, which is not
+              // necessarily the one asked for: with no explicit model the
+              // session runs the CLI's default.
+              model: refused.original_model,
+            };
+          }
         }
         if (message.type === "assistant") {
           const api = message.message ?? {};
           const content = (api.content ?? []) as SdkContentBlock[];
           const apiId = (api as { id?: string }).id;
+          // Retract before flushing: this frame replaces the ones it names,
+          // and their text must never reach the caller.
+          const supersedes = (message as { supersedes?: string[] }).supersedes;
+          if (supersedes?.length) retract(supersedes);
           if (group && (group.id === undefined || group.id !== apiId))
             flushGroup();
-          if (!group) group = { id: apiId, texts: [], builtins: [] };
+          if (!group)
+            group = {
+              id: apiId,
+              uuid: (message as { uuid?: string }).uuid,
+              texts: [],
+              builtins: [],
+            };
 
           // Count and report usage once per API call, and only for the main
           // thread (subagent calls don't describe our window).
@@ -322,7 +396,7 @@ export class LocalClient implements AIProvider {
           ) {
             if (apiId) seenApiMessageIds.add(apiId);
             iteration += 1;
-            options.onUsage?.(usageOf(usage, contextWindow, iteration));
+            options.onUsage?.(localUsageOf(usage, contextWindow, iteration));
           }
 
           for (const block of content) {
@@ -376,6 +450,9 @@ export class LocalClient implements AIProvider {
         await queryIterator.return();
       }
     }
+    // A refused turn can end without a result message at all; report the
+    // refusal rather than the generic shape complaint.
+    if (refusal) throw refusalError();
     throw new Error("LocalClient query ended without a result message");
   }
 

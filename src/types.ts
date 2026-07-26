@@ -43,9 +43,9 @@ export type ContextUsage = {
    */
   percentUsed: number;
   /** 1-based index of the model API call within this sendMessage turn. */
-  iteration?: number;
+  iteration: number;
   /** Backend that produced this event. */
-  providerKind?: ProviderKind;
+  providerKind: ProviderKind;
   /**
    * Estimated harness overhead included in this call's context beyond
    * app-supplied content (local backend only).
@@ -68,10 +68,18 @@ export type TurnUsage = {
    * Authoritative window when the backend reports one (local: SDK modelUsage),
    * else the model map.
    */
-  contextWindow?: number;
+  contextWindow: number;
   /** Provider-reported cost for the turn (local backend only). */
   costUSD?: number;
-  providerKind?: ProviderKind;
+  providerKind: ProviderKind;
+  /**
+   * Estimated harness overhead carried in *each* call's context beyond
+   * app-supplied content (local backend only) — the same per-call figure
+   * ContextUsage reports, not a turn total. Do not multiply by
+   * iterationCount. Budget app content for the next call against
+   * contextWindow - sessionOverheadTokens.
+   */
+  sessionOverheadTokens?: number;
 };
 
 export type ToolActivityPhase = "start" | "end" | "commentary";

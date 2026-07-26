@@ -20,7 +20,9 @@ vi.mock("../providers", () => ({
   },
 }));
 
-const { createProvider } = await import("./createProvider");
+const { createProvider, resolveProviderKind } = await import(
+  "./createProvider"
+);
 const { AnthropicClient, LocalClient } = await import("../providers");
 
 afterEach(() => {
@@ -75,5 +77,45 @@ describe("createProvider", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-env");
     createProvider();
     expect(anthropicKeys).toEqual([undefined]);
+  });
+});
+
+describe("resolveProviderKind", () => {
+  it("reports the anthropic backend when ANTHROPIC_API_KEY is set", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-env");
+    expect(resolveProviderKind()).toBe("anthropic");
+  });
+
+  it("reports the local backend when ANTHROPIC_API_KEY is unset", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    expect(resolveProviderKind()).toBe("local");
+  });
+
+  it("honours an explicit backend over the ambient environment", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-env");
+    expect(resolveProviderKind({ backend: "local" })).toBe("local");
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    expect(resolveProviderKind({ backend: "anthropic" })).toBe("anthropic");
+  });
+
+  it("treats a config apiKey as selecting the anthropic backend", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    expect(resolveProviderKind({ apiKey: "sk-config" })).toBe("anthropic");
+  });
+
+  it("answers without constructing a client", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-env");
+    resolveProviderKind();
+    resolveProviderKind({ backend: "local" });
+    expect(anthropicKeys).toEqual([]);
+    expect(anthropicSend).not.toHaveBeenCalled();
+    expect(localSend).not.toHaveBeenCalled();
+  });
+
+  it("agrees with the backend createProvider actually builds", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-env");
+    expect(createProvider().providerKind).toBe(resolveProviderKind());
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    expect(createProvider().providerKind).toBe(resolveProviderKind());
   });
 });
