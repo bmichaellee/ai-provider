@@ -48,6 +48,47 @@ Every client exposes which backend it is as `providerKind` (`"anthropic"` or
 of sniffing `ANTHROPIC_API_KEY` yourself — anything other than `"local"` is a
 metered API.
 
+Where you need the answer but hold no provider — a health check, a startup
+banner — `resolveProviderKind()` applies the same rules without constructing
+one:
+
+```ts
+import { resolveProviderKind } from "@bmichaellee/ai-provider";
+
+resolveProviderKind(); // "anthropic" | "local", from the same env/config rules
+resolveProviderKind({ backend: "local" }); // "local"
+```
+
+## Models
+
+`ClaudeModels` names one model per family, and each name always points at the
+latest release of that family:
+
+```ts
+ClaudeModels.Sonnet; // claude-sonnet-5
+ClaudeModels.Opus; // claude-opus-5
+ClaudeModels.Haiku; // claude-haiku-4-5
+ClaudeModels.Fable; // claude-fable-5
+```
+
+Because the names track the latest release, upgrading this package can change
+which model a name resolves to — see the changelog for any release that moves
+one. Superseded models stay selectable by literal (`"claude-opus-4-8"` is still
+a valid `ClaudeModel` with a full catalog entry); they simply lose their named
+constant, so pinning is explicit.
+
+Model ids from a config file, a request body, or a database row are just
+strings. Validate them with `claudeModelSchema`, and size budgets with the
+total lookups, which fall back to the default model rather than returning
+`undefined` for a model the catalog has not heard of:
+
+```ts
+claudeModelSchema.parse(row.model); // throws on an unknown id
+contextWindowFor(row.model); // always a positive number
+maxTokensFor(row.model);
+supportsEffort(row.model);
+```
+
 ## Tools
 
 A tool is a name, a description, a zod v4 object schema, and a `run` function
@@ -109,11 +150,44 @@ intentionally has no `percentUsed`: cumulative tokens divided by the window is
 not a meaningful fullness number. Window fullness lives in `onUsage`; turn
 cost lives in `onTurnUsage`.
 
-On the local backend, every `ContextUsage` also carries
+On the local backend, every `ContextUsage` **and** `TurnUsage` also carries
 `sessionOverheadTokens` (the exported `LOCAL_SESSION_OVERHEAD_TOKENS`
 estimate, ~65k): Claude Code's built-in tool schemas and machinery occupy that
 much of each call's context beyond what you supplied. Budget app content
-against `contextWindow - sessionOverheadTokens`.
+against `contextWindow - sessionOverheadTokens`. It is a per-call figure on
+both events — never multiply it by `iterationCount`.
+
+Every field above is also exported as a runtime schema — `contextUsageSchema`,
+`turnUsageSchema`, `toolActivitySchema` — so a consumer that needs to validate
+or re-publish these events can derive from them rather than hand-mirroring the
+types and re-breaking on every field this package adds.
+
+## When the model declines
+
+Both backends throw `RefusalError` when the model refuses a request, rather
+than resolving with an empty segment list that reads as a successful turn with
+nothing to say. On the local backend, a refusal the Claude Code harness
+retried successfully on a fallback model is not a refusal from your side and
+does not throw.
+
+```ts
+import { isRefusalError } from "@bmichaellee/ai-provider";
+
+try {
+  await ai.sendMessage(messages);
+} catch (error) {
+  if (isRefusalError(error)) {
+    // error.category  — "cyber" | "bio" | ... | null, open-ended
+    // error.explanation — provider prose, display only
+    // error.providerKind, error.model
+  }
+}
+```
+
+`onTurnUsage` fires before the throw: the calls were made and, on a metered
+backend, billed. Prefer `isRefusalError()` to `instanceof RefusalError` at a
+package boundary — a consumer that resolves two copies of this package gets
+two distinct classes, and `instanceof` quietly returns false for one of them.
 
 ## The local backend keeps its built-in tools
 
@@ -176,9 +250,16 @@ keep working unchanged.
 
 ## Peer dependencies
 
-- `zod` ^4 (tool schemas; v4's `z.toJSONSchema` is used)
-- `@anthropic-ai/sdk` (Anthropic backend)
-- `@anthropic-ai/claude-agent-sdk` — optional; only needed for the local backend
+- `zod` ^4 (tool schemas and the exported runtime schemas; v4's
+  `z.toJSONSchema` is used)
+- `@anthropic-ai/sdk` >=0.115.0 (Anthropic backend)
+- `@anthropic-ai/claude-agent-sdk` >=0.3.220 — optional; only needed for the
+  local backend
+
+The floors are the versions this package is built and tested against. The
+agent-SDK floor in particular is not cosmetic: releases before 0.3.220 report a
+200,000-token context window for Claude Opus 5, which this package would
+forward through `onTurnUsage` as authoritative.
 
 ## Releasing
 

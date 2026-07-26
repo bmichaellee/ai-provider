@@ -4,9 +4,15 @@ export {
   ClaudeContextWindow,
   ClaudeMaxTokens,
   ClaudeModels,
+  DEFAULT_CONTEXT_WINDOW,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  claudeEffortSchema,
+  claudeModelSchema,
+  contextWindowFor,
+  maxTokensFor,
   modelSupportsEffort,
+  supportsEffort,
 } from "./types";
 export type {
   CacheControlEphemeral,

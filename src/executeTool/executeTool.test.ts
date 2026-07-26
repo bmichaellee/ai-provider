@@ -1,16 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { z } from "zod";
 
-import type { ToolContext, ToolSpec } from "../types";
+import type { ToolContext } from "../types";
 import { executeTool } from "./executeTool";
-
-const echoTool = (overrides: Partial<ToolSpec> = {}): ToolSpec => ({
-  name: "echo",
-  description: "echoes",
-  schema: z.object({ value: z.string() }),
-  run: async (input: any) => `echoed:${input.value}`,
-  ...overrides,
-});
+import { echoTool } from "../testing/tools";
 
 afterEach(() => {
   vi.restoreAllMocks();

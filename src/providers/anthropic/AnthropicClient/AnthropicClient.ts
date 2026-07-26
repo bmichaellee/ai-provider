@@ -2,14 +2,15 @@ import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 
 import {
-  ClaudeContextWindow,
-  ClaudeMaxTokens,
   DEFAULT_MODEL,
-  modelSupportsEffort,
+  contextWindowFor,
+  maxTokensFor,
+  supportsEffort,
 } from "../types";
+import { contextUsageOf } from "../usage";
+import { RefusalError } from "../../../errors";
 import type {
   AIProvider,
-  ContextUsage,
   ProviderMessage,
   SendOptions,
   ToolContext,
@@ -32,29 +33,6 @@ const textOf = (content: Anthropic.ContentBlock[]): string =>
     .map((block) => block.text)
     .join("\n");
 
-const usageOf = (
-  usage: Anthropic.Usage | undefined,
-  contextWindow: number,
-  iteration: number,
-): ContextUsage | undefined => {
-  if (!usage) return undefined;
-  const inputTokens = usage.input_tokens;
-  const cacheCreationInputTokens = usage.cache_creation_input_tokens ?? 0;
-  const cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
-  const consumed =
-    inputTokens + cacheCreationInputTokens + cacheReadInputTokens;
-  return {
-    inputTokens,
-    outputTokens: usage.output_tokens,
-    cacheCreationInputTokens,
-    cacheReadInputTokens,
-    contextWindow,
-    percentUsed: Math.round((consumed / contextWindow) * 1000) / 10,
-    iteration,
-    providerKind: "anthropic",
-  };
-};
-
 export class AnthropicClient implements AIProvider {
   readonly providerKind = "anthropic" as const;
 
@@ -69,8 +47,9 @@ export class AnthropicClient implements AIProvider {
     options: SendOptions<TApp> = {},
   ): Promise<string[]> {
     const model = options.model ?? DEFAULT_MODEL;
+    const contextWindow = contextWindowFor(model);
     const effort =
-      options.effort && modelSupportsEffort[model] ? options.effort : undefined;
+      options.effort && supportsEffort(model) ? options.effort : undefined;
     const tools = options.tools ?? [];
     const byName = new Map(tools.map((tool) => [tool.name, tool]));
     const conversation: Anthropic.MessageParam[] = [...messages];
@@ -92,7 +71,7 @@ export class AnthropicClient implements AIProvider {
       cacheCreationInputTokens: 0,
       cacheReadInputTokens: 0,
       iterationCount: 0,
-      contextWindow: ClaudeContextWindow[model],
+      contextWindow,
       providerKind: "anthropic",
     };
     const emitTurnUsage = () => {
@@ -102,15 +81,25 @@ export class AnthropicClient implements AIProvider {
     for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
       const stream = this.client.messages.stream({
         model,
-        max_tokens: ClaudeMaxTokens[model],
+        max_tokens: maxTokensFor(model),
         system: options.system,
+        // Sent explicitly rather than left to the model's default: the local
+        // backend always runs adaptive, and omitting this would make the same
+        // model think on one backend and not the other.
+        thinking: { type: "adaptive" },
         ...(effort ? { output_config: { effort } } : {}),
         ...(tools.length ? { tools: tools.map(toAnthropicTool) } : {}),
         messages: conversation,
       });
       const message = await stream.finalMessage();
 
-      const usage = usageOf(message.usage, ClaudeContextWindow[model], turn + 1);
+      const usage = message.usage
+        ? contextUsageOf(message.usage, {
+            contextWindow,
+            iteration: turn + 1,
+            providerKind: "anthropic",
+          })
+        : undefined;
       if (usage) {
         turnTotals.inputTokens += usage.inputTokens;
         turnTotals.outputTokens += usage.outputTokens;
@@ -118,6 +107,19 @@ export class AnthropicClient implements AIProvider {
         turnTotals.cacheReadInputTokens += usage.cacheReadInputTokens;
         turnTotals.iterationCount += 1;
         options.onUsage?.(usage);
+      }
+
+      // Report the spend before throwing: a refusal before any output is not
+      // billed at all, and a caller's ledger needs that zero as much as it
+      // needs a non-zero.
+      if (message.stop_reason === "refusal") {
+        emitTurnUsage();
+        throw new RefusalError({
+          providerKind: "anthropic",
+          model,
+          category: message.stop_details?.category ?? null,
+          explanation: message.stop_details?.explanation ?? null,
+        });
       }
 
       if (message.stop_reason !== "tool_use") {
@@ -181,6 +183,9 @@ export class AnthropicClient implements AIProvider {
       }
     }
 
+    // Same emit-then-throw rule as the refusal path: these turns were paid
+    // for, so their usage is reported even though the turn failed.
+    emitTurnUsage();
     throw new Error(
       `AnthropicClient exceeded ${MAX_TOOL_TURNS} tool-use turns`,
     );

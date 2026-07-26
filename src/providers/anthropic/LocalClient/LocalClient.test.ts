@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { z } from "zod";
 
 import type {
   ProviderMessage,
@@ -7,6 +6,8 @@ import type {
   ToolContext,
   ToolSpec,
 } from "../../../types";
+import { echoTool } from "../../../testing/tools";
+import { ClaudeModels } from "../types";
 
 let queryMessages: any[] = [];
 const queryCalls: any[] = [];
@@ -121,13 +122,6 @@ const toolResult = (
 const search = (id = "tu1") =>
   toolUse(id, "WebSearch", { query: "solar flares" });
 
-const echoTool = (overrides: Partial<ToolSpec> = {}): ToolSpec => ({
-  name: "echo",
-  description: "echoes",
-  schema: z.object({ value: z.string() }),
-  run: async (input: any) => `echoed:${input.value}`,
-  ...overrides,
-});
 
 const registerTool = async (spec: ToolSpec, options: SendOptions<any> = {}) => {
   queryMessages = [result("success", "ok")];
@@ -336,6 +330,18 @@ describe("LocalClient.sendMessage", () => {
     queryMessages = [result("success", "ok")];
     await send({ effort: "high" });
     expect(queryCalls[0].options.effort).toBe("high");
+  });
+
+  it("passes the requested model to the SDK", async () => {
+    queryMessages = [result("success", "ok")];
+    await send({ model: ClaudeModels.Opus });
+    expect(queryCalls[0].options.model).toBe(ClaudeModels.Opus);
+  });
+
+  it("leaves the model unset so the session default applies when none is given", async () => {
+    queryMessages = [result("success", "ok")];
+    await send();
+    expect(queryCalls[0].options.model).toBeUndefined();
   });
 
   it("does not configure MCP servers when there are no tools", async () => {
@@ -576,6 +582,7 @@ describe("LocalClient.sendMessage", () => {
       contextWindow: 200_000,
       costUSD: 1.25,
       providerKind: "local",
+      sessionOverheadTokens: LOCAL_SESSION_OVERHEAD_TOKENS,
     });
   });
 
@@ -600,6 +607,28 @@ describe("LocalClient.sendMessage", () => {
     expect(onTurnUsage).toHaveBeenCalledWith(
       expect.objectContaining({ contextWindow: 200_000 }),
     );
+  });
+
+  it("ignores an unusable provider-reported window in favour of the model map", async () => {
+    const usage = {
+      input_tokens: 1000,
+      output_tokens: 10,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    };
+    for (const unusable of [0, Number.NaN, -1]) {
+      queryMessages = [
+        result("success", "ok", usage, {
+          modelUsage: { "claude-haiku-4-5": { contextWindow: unusable } },
+        }),
+      ];
+      const onTurnUsage = vi.fn();
+      await send({ model: "claude-haiku-4-5", onTurnUsage });
+      expect(onTurnUsage).toHaveBeenCalledWith(
+        expect.objectContaining({ contextWindow: 200_000 }),
+      );
+      queryCalls.length = 0;
+    }
   });
 
   it("falls back to the model map window and counted iterations when the result is bare", async () => {
@@ -912,6 +941,109 @@ describe("LocalClient interstitial commentary", () => {
     const streamed: string[] = [];
     expect(await send({ onText: (s: string) => streamed.push(s) })).toEqual([]);
     expect(streamed).toEqual([]);
+  });
+});
+
+describe("LOCAL_SESSION_OVERHEAD_TOKENS", () => {
+  it("stays within the range its documentation claims to have measured", () => {
+    // Every other assertion compares against the constant itself, so they
+    // hold for any value — including zero, which would silently turn the
+    // documented `contextWindow - sessionOverheadTokens` budget into a no-op.
+    // This one pins the magnitude the docstring and README both promise.
+    expect(LOCAL_SESSION_OVERHEAD_TOKENS).toBeGreaterThanOrEqual(60_000);
+    expect(LOCAL_SESSION_OVERHEAD_TOKENS).toBeLessThanOrEqual(75_000);
+  });
+});
+
+describe("LocalClient refusals", () => {
+  const refusalNotice = (
+    subtype: string,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    type: "system",
+    subtype,
+    original_model: "claude-opus-5",
+    content: "I can't help with that.",
+    ...extra,
+  });
+
+  it("raises a refusal the harness could not retry", async () => {
+    queryMessages = [
+      refusalNotice("model_refusal_no_fallback", {
+        api_refusal_category: "cyber",
+        api_refusal_explanation: "declined",
+      }),
+      result("success", ""),
+    ];
+    await expect(send()).rejects.toMatchObject({
+      name: "RefusalError",
+      category: "cyber",
+      explanation: "declined",
+      providerKind: "local",
+    });
+  });
+
+  it("names the model that actually ran, not the package default", async () => {
+    queryMessages = [
+      refusalNotice("model_refusal_no_fallback", {
+        original_model: "claude-opus-5",
+      }),
+      result("success", ""),
+    ];
+    // No model requested, so the session picked its own — the error must name
+    // that one rather than this package's default.
+    await expect(send()).rejects.toMatchObject({ model: "claude-opus-5" });
+  });
+
+  it("raises a refusal reported only by the result's stop reason", async () => {
+    queryMessages = [result("success", "", undefined, { stop_reason: "refusal" })];
+    await expect(send()).rejects.toMatchObject({ name: "RefusalError" });
+  });
+
+  it("does not raise when the harness retried on a fallback model", async () => {
+    queryMessages = [
+      assistantWith([textBlock("the retry's answer")], { id: "m1" }),
+      refusalNotice("model_refusal_fallback", {
+        fallback_model: "claude-opus-4-8",
+      }),
+      result("success", "the retry's answer"),
+    ];
+    expect(await send()).toEqual(["the retry's answer"]);
+  });
+
+  it("withholds the refused leg's text when a superseding frame replaces it", async () => {
+    queryMessages = [
+      {
+        ...assistantWith([textBlock("the refused partial")], { id: "m0" }),
+        uuid: "u-refused",
+      },
+      {
+        ...assistantWith([textBlock("the retry's answer")], { id: "m1" }),
+        uuid: "u-retry",
+        supersedes: ["u-refused"],
+      },
+      result("success", "the retry's answer"),
+    ];
+    const streamed: string[] = [];
+    expect(await send({ onText: (s: string) => streamed.push(s) })).toEqual([
+      "the retry's answer",
+    ]);
+    expect(streamed).not.toContain("the refused partial");
+  });
+
+  it("withholds retracted text named by the end-of-turn fallback notice", async () => {
+    queryMessages = [
+      {
+        ...assistantWith([textBlock("the refused partial")], { id: "m0" }),
+        uuid: "u-refused",
+      },
+      { ...assistantWith([textBlock("the retry's answer")], { id: "m1" }), uuid: "u-retry" },
+      refusalNotice("model_refusal_fallback", {
+        retracted_message_uuids: ["u-refused"],
+      }),
+      result("success", "the retry's answer"),
+    ];
+    expect(await send()).toEqual(["the retry's answer"]);
   });
 });
 
