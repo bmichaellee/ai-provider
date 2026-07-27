@@ -124,6 +124,31 @@ export type SendOptions<TApp = unknown> = {
   stopText?: string;
   onText?: (segment: string) => void;
   /**
+   * Fires for the model's reasoning, once per thinking block, before the text
+   * of the call that produced it. Registering it is what makes the reasoning
+   * visible: both backends already request adaptive thinking, but they ask
+   * for it summarized only when this is set and omitted otherwise, so an
+   * unlistening consumer keeps today's behavior. Thinking is a side channel —
+   * it never enters the returned segments or `onText`, and it is never
+   * replayed to the model.
+   *
+   * What arrives is a provider-side summary, not the raw chain of thought,
+   * which no backend exposes. A model may decline to summarize and send
+   * nothing, so treat the stream as advisory. Reasoning bills identically
+   * whether or not you listen: the display setting governs visibility, not
+   * whether the model thinks.
+   *
+   * Only this conversation's reasoning is reported. Subagent thinking on the
+   * local backend is excluded, as subagent usage is.
+   *
+   * Like `onText`, a fired callback cannot be recalled. When the local
+   * backend retries a refusal on a fallback model, the refused leg's text is
+   * retracted from the returned segments — but any thinking already delivered
+   * for it has been delivered. Treat a retraction as replacing what came
+   * before it.
+   */
+  onThinking?: (segment: string) => void;
+  /**
    * Fires once per model API call, with that single call's usage. On the
    * local backend, calls made by subagents are excluded — they describe a
    * subagent's context, not this conversation's; their spend still lands in

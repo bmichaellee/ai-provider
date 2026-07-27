@@ -33,6 +33,20 @@ const textOf = (content: Anthropic.ContentBlock[]): string =>
     .map((block) => block.text)
     .join("\n");
 
+/**
+ * Readable reasoning from one message. `redacted_thinking` blocks are skipped
+ * — they carry an encrypted blob, not text — and so are the empty `thinking`
+ * strings a display of "omitted" returns, so a caller listening on a model
+ * that declines to summarize gets silence rather than blank segments.
+ */
+const thinkingOf = (content: Anthropic.ContentBlock[]): string[] =>
+  content
+    .filter(
+      (block): block is Anthropic.ThinkingBlock => block.type === "thinking",
+    )
+    .map((block) => block.thinking)
+    .filter((thinking) => thinking.trim().length > 0);
+
 export class AnthropicClient implements AIProvider {
   readonly providerKind = "anthropic" as const;
 
@@ -85,8 +99,13 @@ export class AnthropicClient implements AIProvider {
         system: options.system,
         // Sent explicitly rather than left to the model's default: the local
         // backend always runs adaptive, and omitting this would make the same
-        // model think on one backend and not the other.
-        thinking: { type: "adaptive" },
+        // model think on one backend and not the other. Display is opt-in —
+        // every current model defaults it to "omitted", which returns
+        // thinking blocks whose text is the empty string, so a consumer that
+        // wants to read the reasoning has to ask for a summary.
+        thinking: options.onThinking
+          ? { type: "adaptive", display: "summarized" }
+          : { type: "adaptive" },
         ...(effort ? { output_config: { effort } } : {}),
         ...(tools.length ? { tools: tools.map(toAnthropicTool) } : {}),
         messages: conversation,
@@ -108,6 +127,14 @@ export class AnthropicClient implements AIProvider {
         turnTotals.iterationCount += 1;
         options.onUsage?.(usage);
       }
+
+      // After usage, before anything that can throw or return: the reasoning
+      // belongs to this call whether or not the call went on to answer, and a
+      // refusal that produced partial output is exactly when a caller most
+      // wants to see it.
+      if (options.onThinking)
+        for (const thinking of thinkingOf(message.content))
+          options.onThinking(thinking);
 
       // Report the spend before throwing: a refusal before any output is not
       // billed at all, and a caller's ledger needs that zero as much as it

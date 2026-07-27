@@ -99,7 +99,12 @@ const toQueryMessages = (script: Script, model: string) => {
       message: {
         id: `m${i}`,
         ...(call.usage ? { usage: wireUsage(call.usage) } : {}),
-        content: call.text ? [{ type: "text", text: call.text }] : [],
+        content: [
+          ...(call.thinking
+            ? [{ type: "thinking", thinking: call.thinking }]
+            : []),
+          ...(call.text ? [{ type: "text", text: call.text }] : []),
+        ],
       },
     });
     if (script.stopAfterCall === i + 1)

@@ -311,12 +311,24 @@ describe("LocalClient.sendMessage", () => {
     expect(queryCalls[0].prompt).toBe("hello");
   });
 
-  it("asks the SDK to think adaptively but omit thinking from the output", async () => {
+  it("asks the SDK to think adaptively but omit thinking when nobody is listening", async () => {
     queryMessages = [result("success", "ok")];
     await send();
     expect(queryCalls[0].options.thinking).toEqual({
       type: "adaptive",
       display: "omitted",
+    });
+  });
+
+  it("asks for summarized thinking when a consumer registers onThinking", async () => {
+    queryMessages = [result("success", "ok")];
+    await send({ onThinking: () => {} });
+    // Set explicitly rather than left unset: the install's own
+    // --thinking-display default would otherwise decide, making the same
+    // call behave differently on two machines.
+    expect(queryCalls[0].options.thinking).toEqual({
+      type: "adaptive",
+      display: "summarized",
     });
   });
 
@@ -941,6 +953,97 @@ describe("LocalClient interstitial commentary", () => {
     const streamed: string[] = [];
     expect(await send({ onText: (s: string) => streamed.push(s) })).toEqual([]);
     expect(streamed).toEqual([]);
+  });
+});
+
+describe("LocalClient thinking", () => {
+  const thinkingBlock = (thinking: string) => ({ type: "thinking", thinking });
+
+  it("delivers thinking to onThinking and keeps it out of the segments", async () => {
+    queryMessages = [
+      assistantWith([thinkingBlock("weighing it up"), textBlock("the answer")]),
+      result("success", "the answer"),
+    ];
+    const thoughts: string[] = [];
+    const segments = await send({
+      onThinking: (segment) => thoughts.push(segment),
+    });
+    expect(thoughts).toEqual(["weighing it up"]);
+    expect(segments).toEqual(["the answer"]);
+  });
+
+  it("keeps thinking out of onText", async () => {
+    queryMessages = [
+      assistantWith([thinkingBlock("weighing it up"), textBlock("the answer")]),
+      result("success", "the answer"),
+    ];
+    const streamed: string[] = [];
+    await send({
+      onText: (segment) => streamed.push(segment),
+      onThinking: () => {},
+    });
+    expect(streamed).toEqual(["the answer"]);
+  });
+
+  it("reports thinking before the text it preceded, which is buffered until its message completes", async () => {
+    queryMessages = [
+      assistantWith([thinkingBlock("weighing it up"), textBlock("the answer")]),
+      result("success", "the answer"),
+    ];
+    const events: string[] = [];
+    await send({
+      onText: (segment) => events.push(`text:${segment}`),
+      onThinking: (segment) => events.push(`thinking:${segment}`),
+    });
+    expect(events).toEqual(["thinking:weighing it up", "text:the answer"]);
+  });
+
+  it("routes thinking to onThinking, not to the tool commentary channel it shares a message with", async () => {
+    queryMessages = [
+      assistantWith([thinkingBlock("search first"), search()]),
+      assistant("the real reply"),
+      result("success", "the real reply"),
+    ];
+    const thoughts: string[] = [];
+    const activity: any[] = [];
+    await send({
+      onThinking: (segment) => thoughts.push(segment),
+      onToolActivity: (event) => activity.push(event),
+    });
+    expect(thoughts).toEqual(["search first"]);
+    expect(activity.map((event) => event.phase)).toEqual(["start"]);
+  });
+
+  it("skips subagent thinking so the stream stays this conversation's reasoning", async () => {
+    queryMessages = [
+      assistantWith([thinkingBlock("subagent musing")], {
+        id: "s1",
+        parent: "tu1",
+      }),
+      assistant("the answer"),
+      result("success", "the answer"),
+    ];
+    const onThinking = vi.fn();
+    await send({ onThinking });
+    expect(onThinking).not.toHaveBeenCalled();
+  });
+
+  it("stays silent on the empty thinking blocks an omitted display returns", async () => {
+    queryMessages = [
+      assistantWith([thinkingBlock(""), textBlock("the answer")]),
+      result("success", "the answer"),
+    ];
+    const onThinking = vi.fn();
+    await send({ onThinking });
+    expect(onThinking).not.toHaveBeenCalled();
+  });
+
+  it("drops thinking from the segments even with no listener registered", async () => {
+    queryMessages = [
+      assistantWith([thinkingBlock("weighing it up"), textBlock("the answer")]),
+      result("success", "the answer"),
+    ];
+    expect(await send()).toEqual(["the answer"]);
   });
 });
 

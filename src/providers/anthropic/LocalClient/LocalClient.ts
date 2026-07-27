@@ -113,6 +113,7 @@ const localTurnUsageOf = (
 type SdkContentBlock = {
   type: string;
   text?: string;
+  thinking?: string;
   id?: string;
   name?: string;
   input?: unknown;
@@ -186,6 +187,9 @@ export class LocalClient implements AIProvider {
       if (!segments.length && options.stopText) emit(options.stopText);
     };
     const activity = (event: ToolActivity) => options.onToolActivity?.(event);
+    const thought = (text: string) => {
+      if (text.trim()) options.onThinking?.(text);
+    };
 
     const mcpServers = tools.length
       ? {
@@ -214,7 +218,14 @@ export class LocalClient implements AIProvider {
         settingSources: [],
         permissionMode: "dontAsk",
         persistSession: false,
-        thinking: { type: "adaptive", display: "omitted" },
+        // Display is opt-in, and set explicitly on both branches: leaving it
+        // unset would hand the decision to the install's own
+        // --thinking-display default, so the same call would behave
+        // differently on two machines.
+        thinking: {
+          type: "adaptive",
+          display: options.onThinking ? "summarized" : "omitted",
+        },
         ...(mcpServers ? { mcpServers } : {}),
         allowedTools: tools.map((t) => `${TOOL_PREFIX}${t.name}`),
       },
@@ -400,6 +411,17 @@ export class LocalClient implements AIProvider {
           }
 
           for (const block of content) {
+            // Emitted straight out rather than buffered with the text: it is
+            // never transcript content, so it must not reach group.texts,
+            // where it would be returned as a segment or — when the message
+            // also carries a built-in tool call — diverted as that tool's
+            // commentary. Subagent reasoning is skipped for the same reason
+            // subagent usage is: it describes another thread, not this one.
+            if (block.type === "thinking") {
+              if (message.parent_tool_use_id == null)
+                thought(block.thinking ?? "");
+              continue;
+            }
             if (block.type === "text") {
               if (block.text) group.texts.push(block.text);
               continue;

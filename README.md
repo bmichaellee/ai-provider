@@ -162,6 +162,40 @@ Every field above is also exported as a runtime schema — `contextUsageSchema`,
 or re-publish these events can derive from them rather than hand-mirroring the
 types and re-breaking on every field this package adds.
 
+## Reasoning
+
+Both backends request adaptive thinking, but neither returns it unless you ask.
+Register `onThinking` and the reasoning arrives as its own stream, once per
+thinking block, ahead of the text of the call that produced it:
+
+```ts
+await ai.sendMessage(messages, {
+  onText: (segment) => process.stdout.write(segment),
+  onThinking: (segment) => lab.showRumination(segment),
+});
+```
+
+Registering the callback is what turns the output on: both backends request
+`display: "summarized"` when it is set and `display: "omitted"` when it is not,
+so a consumer that does not listen sees exactly today's behavior. This is a
+visibility switch, not a thinking switch — the model reasons and bills the same
+either way, so listening costs nothing beyond the summary tokens.
+
+Thinking is strictly a side channel. It never enters the returned segments or
+`onText`, is never replayed to the model, and on the local backend it is routed
+clear of the `onToolActivity` commentary channel even when the model reasons in
+the same message as a built-in tool call. Subagent reasoning is excluded, as
+subagent usage is — what you get is this conversation's thinking.
+
+What arrives is a provider-side summary, not the raw chain of thought, which no
+current model exposes. Two consequences worth designing around: a model may
+decline to summarize and send nothing at all, so treat the stream as advisory
+rather than guaranteed; and, as with `onText`, a delivered segment cannot be
+recalled. When the local harness retries a refusal on a fallback model it
+retracts the refused leg's text from the returned segments, but thinking already
+handed to your callback has been handed over — render a retraction as replacing
+what preceded it.
+
 ## When the model declines
 
 Both backends throw `RefusalError` when the model refuses a request, rather
