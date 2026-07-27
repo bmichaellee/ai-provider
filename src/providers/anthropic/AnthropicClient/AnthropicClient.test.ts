@@ -226,6 +226,15 @@ describe("AnthropicClient.sendMessage", () => {
     expect(streamCalls[0].thinking).toEqual({ type: "adaptive" });
   });
 
+  it("asks for summarized thinking only when a consumer is listening", async () => {
+    finalMessages = [textMessage("ok")];
+    await send({ onThinking: () => {} });
+    expect(streamCalls[0].thinking).toEqual({
+      type: "adaptive",
+      display: "summarized",
+    });
+  });
+
   it("sends a numeric output cap even for a model absent from the catalog", async () => {
     finalMessages = [textMessage("ok")];
     await send({ model: "claude-not-a-real-model" as any });
@@ -589,6 +598,95 @@ describe("AnthropicClient.sendMessage", () => {
     await expect(send({ tools: [echoTool()] })).rejects.toThrow(
       /exceeded 8 tool-use turns/,
     );
+  });
+});
+
+describe("AnthropicClient thinking", () => {
+  const thinkingMessage = (thinking: string, text: string) => ({
+    stop_reason: "end_turn",
+    content: [
+      { type: "thinking", thinking },
+      { type: "text", text },
+    ],
+  });
+
+  it("delivers thinking to onThinking and keeps it out of the segments", async () => {
+    finalMessages = [thinkingMessage("weighing it up", "the answer")];
+    const thoughts: string[] = [];
+    const segments = await send({
+      onThinking: (segment) => thoughts.push(segment),
+    });
+    expect(thoughts).toEqual(["weighing it up"]);
+    expect(segments).toEqual(["the answer"]);
+  });
+
+  it("keeps thinking out of onText", async () => {
+    finalMessages = [thinkingMessage("weighing it up", "the answer")];
+    const streamed: string[] = [];
+    await send({
+      onText: (segment) => streamed.push(segment),
+      onThinking: () => {},
+    });
+    expect(streamed).toEqual(["the answer"]);
+  });
+
+  it("reports thinking before the text it preceded", async () => {
+    finalMessages = [thinkingMessage("weighing it up", "the answer")];
+    const events: string[] = [];
+    await send({
+      onText: (segment) => events.push(`text:${segment}`),
+      onThinking: (segment) => events.push(`thinking:${segment}`),
+    });
+    expect(events).toEqual(["thinking:weighing it up", "text:the answer"]);
+  });
+
+  it("delivers thinking from a call that ends in a tool use, not just the last one", async () => {
+    finalMessages = [
+      {
+        stop_reason: "tool_use",
+        content: [
+          { type: "thinking", thinking: "need the tool" },
+          { type: "tool_use", id: "t1", name: "echo", input: { value: "x" } },
+        ],
+      },
+      thinkingMessage("now I can answer", "done"),
+    ];
+    const thoughts: string[] = [];
+    await send({
+      tools: [echoTool()],
+      onThinking: (segment) => thoughts.push(segment),
+    });
+    expect(thoughts).toEqual(["need the tool", "now I can answer"]);
+  });
+
+  it("skips redacted thinking, which carries no readable text", async () => {
+    finalMessages = [
+      {
+        stop_reason: "end_turn",
+        content: [
+          { type: "redacted_thinking", data: "encrypted-blob" },
+          { type: "text", text: "the answer" },
+        ],
+      },
+    ];
+    const thoughts: string[] = [];
+    const segments = await send({
+      onThinking: (segment) => thoughts.push(segment),
+    });
+    expect(thoughts).toEqual([]);
+    expect(segments).toEqual(["the answer"]);
+  });
+
+  it("stays silent on the empty thinking blocks an omitted display returns", async () => {
+    finalMessages = [thinkingMessage("", "the answer")];
+    const thoughts: string[] = [];
+    await send({ onThinking: (segment) => thoughts.push(segment) });
+    expect(thoughts).toEqual([]);
+  });
+
+  it("drops thinking from the segments even with no listener registered", async () => {
+    finalMessages = [thinkingMessage("weighing it up", "the answer")];
+    expect(await send()).toEqual(["the answer"]);
   });
 });
 

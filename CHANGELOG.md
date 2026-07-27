@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.4.0
+
+Adds an opt-in `onThinking` send option, so a consumer can read the model's
+reasoning instead of having it dropped before it ever arrives.
+
+### Added
+
+- **`SendOptions.onThinking`** — fires once per thinking block, ahead of the
+  text of the call that produced it, on both backends. Thinking is a side
+  channel: it never enters the returned segments or `onText`, is never replayed
+  to the model, and on the local backend it is routed clear of the
+  `onToolActivity` commentary channel even when the model reasons in the same
+  message as a built-in tool call. Subagent reasoning is excluded, as subagent
+  usage already is.
+
+  Registering the callback is also what turns the output on. Both backends now
+  send `thinking.display: "summarized"` when `onThinking` is set and
+  `"omitted"` when it is not — forwarding the blocks alone would not have been
+  enough, because every model in the catalog defaults the display to
+  `"omitted"` and returns thinking blocks whose text is the empty string.
+
+  This is a visibility switch, not a thinking switch. Both backends already
+  requested adaptive thinking, and the model reasons and bills the same under
+  either display setting, so listening adds the summary tokens and nothing
+  else. Consumers that do not pass the callback see 0.3.0 behavior unchanged.
+
+  What arrives is a provider-side summary, not the raw chain of thought, which
+  no current model exposes. A model may decline to summarize and send nothing,
+  so treat the stream as advisory. As with `onText`, a delivered segment cannot
+  be recalled: when the local harness retries a refusal on a fallback model it
+  retracts the refused leg's text from the returned segments, but thinking
+  already handed to the callback has been handed over.
+
+  No runtime schema accompanies it — `onThinking` carries a plain string, as
+  `onText` does, and neither has one.
+
 ## 0.3.0
 
 A breaking release: Claude Opus 5 support, two silent-failure paths made loud,

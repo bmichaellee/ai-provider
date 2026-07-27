@@ -16,6 +16,14 @@ export type ScriptedCall = {
    * empty string, and a neutral script must not sit on that divergence.
    */
   text?: string;
+  /**
+   * Reasoning the model produced before `text`. Scripted unconditionally —
+   * the adapters do not model `thinking.display`, so a backend that requested
+   * omitted thinking still sees blocks here. That is deliberate: it lets the
+   * suite assert thinking stays out of the transcript without relying on the
+   * request-side switch to do the work.
+   */
+  thinking?: string;
   usage?: ScriptedUsage;
 };
 

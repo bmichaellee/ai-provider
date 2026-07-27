@@ -75,6 +75,9 @@ const toFinalMessages = (script: Script) => {
       content: refuses
         ? []
         : [
+            ...(call.thinking
+              ? [{ type: "thinking", thinking: call.thinking }]
+              : []),
             ...(call.text ? [{ type: "text", text: call.text }] : []),
             ...(continues
               ? [

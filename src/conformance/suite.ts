@@ -254,6 +254,38 @@ export const describeConformance = (backend: ConformanceBackend) => {
     expect(streamed).toEqual(segments);
   });
 
+  it("delivers thinking through onThinking, not the returned segments", async () => {
+    const thoughts: string[] = [];
+    const segments = await backend.run(
+      { calls: [{ thinking: "weighing it up", text: "one", usage: usage(10) }] },
+      { onThinking: (segment) => thoughts.push(segment) },
+    );
+    expect(thoughts).toEqual(["weighing it up"]);
+    expect(segments).toEqual(["one"]);
+  });
+
+  it("keeps thinking out of onText", async () => {
+    const streamed: string[] = [];
+    await backend.run(
+      { calls: [{ thinking: "weighing it up", text: "one", usage: usage(10) }] },
+      {
+        onText: (segment) => streamed.push(segment),
+        onThinking: () => {},
+      },
+    );
+    expect(streamed).toEqual(["one"]);
+  });
+
+  it("drops thinking from the transcript even with no onThinking listener", async () => {
+    const streamed: string[] = [];
+    const segments = await backend.run(
+      { calls: [{ thinking: "weighing it up", text: "one", usage: usage(10) }] },
+      { onText: (segment) => streamed.push(segment) },
+    );
+    expect(segments).toEqual(["one"]);
+    expect(streamed).toEqual(["one"]);
+  });
+
   it("returns no segments when a stopping tool produces no text", async () => {
     const segments = await backend.run({
       calls: [{ usage: usage(10) }, { usage: usage(20) }],
