@@ -180,6 +180,34 @@ describe("LocalClient.sendMessage", () => {
     expect(streamed).toEqual(["the question"]);
   });
 
+  it("preserves same-message text buffered before an MCP stop tool fires", async () => {
+    const stopTool = echoTool({
+      run: async (_input: any, ctx?: ToolContext) => {
+        if (ctx) ctx.stop = true;
+        return "stopped";
+      },
+    });
+    queryMessages = [
+      assistantWith(
+        [
+          textBlock("the question"),
+          toolUse("t1", "mcp__tools__echo", { value: "x" }),
+        ],
+        { id: "m1" },
+      ),
+      { type: "__runTool", index: 0, args: { value: "x" } },
+      result("success", "the question"),
+    ];
+    const streamed: string[] = [];
+    expect(
+      await send({
+        tools: [stopTool],
+        onText: (s: string) => streamed.push(s),
+      }),
+    ).toEqual(["the question"]);
+    expect(streamed).toEqual(["the question"]);
+  });
+
   it("yields no segments when a tool stops the turn with no text and no stopText is configured", async () => {
     const stopTool = echoTool({
       name: "disengage",
@@ -225,6 +253,29 @@ describe("LocalClient.sendMessage", () => {
     queryMessages = [
       assistant("the question"),
       { type: "__runTool", index: 0, args: {} },
+      result("success", "the question"),
+    ];
+    expect(await send({ tools: [stopTool], stopText: "[gone]" })).toEqual([
+      "the question",
+    ]);
+  });
+
+  it("keeps same-message pre-stop text instead of replacing it with stopText", async () => {
+    const stopTool = echoTool({
+      run: async (_input: any, ctx?: ToolContext) => {
+        if (ctx) ctx.stop = true;
+        return "stopped";
+      },
+    });
+    queryMessages = [
+      assistantWith(
+        [
+          textBlock("the question"),
+          toolUse("t1", "mcp__tools__echo", { value: "x" }),
+        ],
+        { id: "m1" },
+      ),
+      { type: "__runTool", index: 0, args: { value: "x" } },
       result("success", "the question"),
     ];
     expect(await send({ tools: [stopTool], stopText: "[gone]" })).toEqual([

@@ -260,7 +260,7 @@ export class LocalClient implements AIProvider {
     let group: {
       id: string | undefined;
       uuid: string | undefined;
-      texts: string[];
+      texts: { text: string; preStop: boolean }[];
       builtins: { name: string; id: string }[];
     } | null = null;
     // Text already emitted, keyed by the frame that produced it, so a later
@@ -268,7 +268,10 @@ export class LocalClient implements AIProvider {
     const emittedByUuid = new Map<string, string>();
     const flushGroup = () => {
       if (!group) return;
-      const text = group.texts.join("\n");
+      const text = group.texts
+        .filter((entry) => entry.preStop || !ctx.stop)
+        .map((entry) => entry.text)
+        .join("\n");
       const uuid = group.uuid;
       if (group.builtins.length) {
         if (text.trim()) {
@@ -281,7 +284,7 @@ export class LocalClient implements AIProvider {
             detail: text,
           });
         }
-      } else if (!ctx.stop) {
+      } else {
         const before = segments.length;
         emit(text);
         if (uuid && segments.length > before) emittedByUuid.set(uuid, text);
@@ -423,7 +426,8 @@ export class LocalClient implements AIProvider {
               continue;
             }
             if (block.type === "text") {
-              if (block.text) group.texts.push(block.text);
+              if (block.text)
+                group.texts.push({ text: block.text, preStop: !ctx.stop });
               continue;
             }
             if (block.type !== "tool_use") continue;
