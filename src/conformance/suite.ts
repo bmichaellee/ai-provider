@@ -302,9 +302,13 @@ export const describeConformance = (backend: ConformanceBackend) => {
     expect(segments).toEqual(["[The Weaver disengages.]"]);
   });
 
-  // Deliberately not asserted cross-backend: whether text already written in
-  // the same API message as the stopping tool call survives the stop is a
-  // real divergence. The metered backend emits it; the local one suppresses
-  // it, since text buffered against an identified message is discarded once
-  // ctx.stop is set. Each unit suite pins its own side.
+  it("preserves text already written when a stopping tool ends the turn", async () => {
+    const streamed: string[] = [];
+    const segments = await backend.run(
+      { calls: [{ text: "farewell", usage: usage(10) }], stopAfterCall: 1 },
+      { stopText: "[gone]", onText: (segment) => streamed.push(segment) },
+    );
+    expect(segments).toEqual(["farewell"]);
+    expect(streamed).toEqual(["farewell"]);
+  });
 };
